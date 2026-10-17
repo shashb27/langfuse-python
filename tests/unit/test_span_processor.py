@@ -26,12 +26,14 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
 
 import langfuse._client.span_processor as span_processor_module
 from langfuse._client.client import Langfuse
+from langfuse._client.constants import LANGFUSE_TRACER_NAME
 from langfuse._client.environment_variables import (
     LANGFUSE_FLUSH_AT,
     LANGFUSE_FLUSH_INTERVAL,
     LANGFUSE_OTEL_COMPRESSION,
     LANGFUSE_OTEL_MAX_BATCH_SIZE_BYTES,
 )
+from langfuse._client.span_filter import ANTHROPIC_NATIVE_OTEL_SCOPE
 from langfuse._client.span_processor import LangfuseSpanProcessor
 
 
@@ -400,3 +402,88 @@ def test_on_end_formats_span_only_when_debug_enabled(
     assert ("Processing span name='llm-call'" in caplog.text) == bool(
         expected_formatter_calls
     )
+
+
+@pytest.fixture
+def dedup_processor_env():
+    """Processor wired to an in-memory exporter, plus the tracer scopes needed
+    to reproduce native anthropic spans nested under Langfuse instrumentation."""
+    exporter = InMemorySpanExporter()
+    processor = LangfuseSpanProcessor(
+        public_key="pk-test",
+        secret_key="sk-test",
+        base_url="http://localhost:3000",
+        span_exporter=exporter,
+    )
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+    langfuse_tracer = provider.get_tracer(
+        LANGFUSE_TRACER_NAME, "test", attributes={"public_key": "pk-test"}
+    )
+    anthropic_tracer = provider.get_tracer(ANTHROPIC_NATIVE_OTEL_SCOPE, "1.15.0")
+    yield {
+        "provider": provider,
+        "langfuse_tracer": langfuse_tracer,
+        "anthropic_tracer": anthropic_tracer,
+        "exporter": exporter,
+    }
+    processor.shutdown()
+
+
+def test_native_anthropic_span_nested_under_langfuse_generation_is_dropped(
+    dedup_processor_env,
+):
+    """Drop the native anthropic span when Langfuse already recorded the call."""
+    with dedup_processor_env["langfuse_tracer"].start_as_current_span(
+        "GENERATION ChatAnthropic"
+    ):
+        with dedup_processor_env["anthropic_tracer"].start_as_current_span(
+            "anthropic.messages.create",
+            attributes={"gen_ai.operation.name": "chat"},
+        ):
+            pass
+
+    dedup_processor_env["provider"].force_flush(timeout_millis=5000)
+
+    exported_names = [
+        span.name for span in dedup_processor_env["exporter"].get_finished_spans()
+    ]
+    assert "GENERATION ChatAnthropic" in exported_names
+    assert "anthropic.messages.create" not in exported_names
+
+
+def test_root_native_anthropic_span_is_exported(dedup_processor_env):
+    """Keep root-level native anthropic spans (native-only instrumentation)."""
+    with dedup_processor_env["anthropic_tracer"].start_as_current_span(
+        "anthropic.messages.create",
+        attributes={"gen_ai.operation.name": "chat"},
+    ):
+        pass
+
+    dedup_processor_env["provider"].force_flush(timeout_millis=5000)
+
+    exported_names = [
+        span.name for span in dedup_processor_env["exporter"].get_finished_spans()
+    ]
+    assert "anthropic.messages.create" in exported_names
+
+
+def test_native_anthropic_span_under_non_langfuse_parent_is_exported(
+    dedup_processor_env,
+):
+    """Keep native anthropic spans whose parent is not Langfuse-instrumented."""
+    app_tracer = dedup_processor_env["provider"].get_tracer("my.app")
+    with app_tracer.start_as_current_span("request"):
+        with dedup_processor_env["anthropic_tracer"].start_as_current_span(
+            "anthropic.messages.create",
+            attributes={"gen_ai.operation.name": "chat"},
+        ):
+            pass
+
+    dedup_processor_env["provider"].force_flush(timeout_millis=5000)
+
+    exported_names = [
+        span.name for span in dedup_processor_env["exporter"].get_finished_spans()
+    ]
+    assert "anthropic.messages.create" in exported_names
+    assert "request" not in exported_names

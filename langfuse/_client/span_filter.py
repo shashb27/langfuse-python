@@ -4,9 +4,14 @@ This module provides composable filter functions that determine which spans
 the LangfuseSpanProcessor forwards to the Langfuse backend.
 """
 
+from typing import Container
+
 from opentelemetry.sdk.trace import ReadableSpan
 
 from langfuse._client.constants import LANGFUSE_TRACER_NAME
+
+ANTHROPIC_NATIVE_OTEL_SCOPE = "com.anthropic.sdk.python"
+"""Instrumentation scope of the anthropic SDK's built-in OpenTelemetry tracing (>= 1.14)."""
 
 KNOWN_LLM_INSTRUMENTATION_SCOPE_PREFIXES = frozenset(
     {
@@ -117,3 +122,31 @@ def is_app_root_eligible(span: ReadableSpan) -> bool:
         span.instrumentation_scope.name,
         span.name,
     ) not in APP_ROOT_INELIGIBLE_SPANS
+
+
+def is_nested_native_anthropic_span(
+    span: ReadableSpan, langfuse_span_ids: Container[int]
+) -> bool:
+    """Return whether the span is a native anthropic SDK span nested under a
+    Langfuse-instrumented span.
+
+    The anthropic SDK (>= 1.14) emits its own ``anthropic.messages.create``
+    span whenever a global tracer provider exists. When the Langfuse
+    instrumentation is also active (for example the LangChain
+    CallbackHandler), that span duplicates the generation already recorded
+    for the same call, double-counting generations and token cost.
+
+    Only the nested case is a duplicate. Root-level native spans keep being
+    exported: for setups that rely on anthropic's native tracing as their
+    only instrumentation, they are the single generation record.
+    """
+    if span.instrumentation_scope is None:
+        return False
+
+    if span.instrumentation_scope.name != ANTHROPIC_NATIVE_OTEL_SCOPE:
+        return False
+
+    if span.parent is None:
+        return False
+
+    return span.parent.span_id in langfuse_span_ids

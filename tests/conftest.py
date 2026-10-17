@@ -107,6 +107,7 @@ def langfuse_memory_client(
         )
         self._app_root_lock = threading.Lock()
         self._span_export_expectation_by_id = {}
+        self._langfuse_span_ids = set()
         BatchSpanProcessor.__init__(
             self,
             span_exporter=memory_exporter,

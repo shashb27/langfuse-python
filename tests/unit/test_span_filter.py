@@ -6,11 +6,13 @@ from typing import Any, Optional
 import pytest
 
 from langfuse.span_filter import (
+    ANTHROPIC_NATIVE_OTEL_SCOPE,
     KNOWN_LLM_INSTRUMENTATION_SCOPE_PREFIXES,
     is_default_export_span,
     is_genai_span,
     is_known_llm_instrumentor,
     is_langfuse_span,
+    is_nested_native_anthropic_span,
 )
 
 
@@ -18,9 +20,13 @@ def _make_span(
     *,
     scope_name: Optional[str] = None,
     attributes: Optional[dict[Any, Any]] = None,
+    parent_span_id: Optional[int] = None,
 ):
     scope = None if scope_name is None else SimpleNamespace(name=scope_name)
-    return SimpleNamespace(instrumentation_scope=scope, attributes=attributes)
+    parent = None if parent_span_id is None else SimpleNamespace(span_id=parent_span_id)
+    return SimpleNamespace(
+        instrumentation_scope=scope, attributes=attributes, parent=parent
+    )
 
 
 def test_is_langfuse_span_true():
@@ -187,3 +193,56 @@ def test_is_default_export_span_rejects_unknown():
         )
         is False
     )
+
+
+def test_is_nested_native_anthropic_span_under_langfuse_parent():
+    """Flag native anthropic spans nested under a Langfuse-instrumented span."""
+    span = _make_span(
+        scope_name=ANTHROPIC_NATIVE_OTEL_SCOPE,
+        attributes={"gen_ai.request.model": "claude-3-5-haiku-latest"},
+        parent_span_id=1234,
+    )
+
+    assert is_nested_native_anthropic_span(span, langfuse_span_ids={1234}) is True
+
+
+def test_is_nested_native_anthropic_span_root_kept():
+    """Keep root-level native anthropic spans (native-only instrumentation)."""
+    span = _make_span(
+        scope_name=ANTHROPIC_NATIVE_OTEL_SCOPE,
+        attributes={"gen_ai.request.model": "claude-3-5-haiku-latest"},
+    )
+
+    assert is_nested_native_anthropic_span(span, langfuse_span_ids=set()) is False
+
+
+def test_is_nested_native_anthropic_span_non_langfuse_parent_kept():
+    """Keep native anthropic spans whose parent is not Langfuse-instrumented."""
+    span = _make_span(
+        scope_name=ANTHROPIC_NATIVE_OTEL_SCOPE,
+        attributes={"gen_ai.request.model": "claude-3-5-haiku-latest"},
+        parent_span_id=9876,
+    )
+
+    assert is_nested_native_anthropic_span(span, langfuse_span_ids={1234}) is False
+
+
+def test_is_nested_native_anthropic_span_other_scope_kept():
+    """Keep spans from other scopes even when nested under Langfuse spans."""
+    span = _make_span(
+        scope_name="other.instrumentation",
+        attributes={"gen_ai.request.model": "claude-3-5-haiku-latest"},
+        parent_span_id=1234,
+    )
+
+    assert is_nested_native_anthropic_span(span, langfuse_span_ids={1234}) is False
+
+
+def test_is_nested_native_anthropic_span_missing_scope_kept():
+    """Keep spans without an instrumentation scope."""
+    span = _make_span(
+        attributes={"gen_ai.request.model": "claude-3-5-haiku-latest"},
+        parent_span_id=1234,
+    )
+
+    assert is_nested_native_anthropic_span(span, langfuse_span_ids={1234}) is False

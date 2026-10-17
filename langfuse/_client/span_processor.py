@@ -15,7 +15,7 @@ import base64
 import logging
 import os
 import threading
-from typing import Callable, Dict, Literal, Optional, cast
+from typing import Callable, Dict, Literal, Optional, Set, cast
 
 from opentelemetry import context as context_api
 from opentelemetry.context import Context
@@ -47,6 +47,7 @@ from langfuse._client.span_filter import (
     is_app_root_eligible,
     is_default_export_span,
     is_langfuse_span,
+    is_nested_native_anthropic_span,
 )
 from langfuse._client.utils import span_formatter
 from langfuse._task_manager.media_manager import MediaManager
@@ -163,6 +164,9 @@ class LangfuseSpanProcessor(BatchSpanProcessor):
 
         self._app_root_lock = threading.Lock()
         self._span_export_expectation_by_id: Dict[str, bool] = {}
+        # Open Langfuse-instrumented span ids, used to detect native anthropic
+        # SDK spans nested under Langfuse instrumentation (duplicate generations).
+        self._langfuse_span_ids: Set[int] = set()
 
         env_flush_at = os.environ.get(LANGFUSE_FLUSH_AT, None)
         if flush_at is None and env_flush_at is not None:
@@ -282,6 +286,24 @@ class LangfuseSpanProcessor(BatchSpanProcessor):
                 )
                 return
 
+            # The anthropic SDK (>= 1.14) emits its own span for every API
+            # call. Nested under Langfuse instrumentation it duplicates the
+            # generation already recorded for the same call; root-level
+            # native spans are the only generation record for native-only
+            # setups and keep flowing.
+            with self._app_root_lock:
+                is_nested_native_anthropic = is_nested_native_anthropic_span(
+                    span, self._langfuse_span_ids
+                )
+
+            if is_nested_native_anthropic:
+                langfuse_logger.debug(
+                    "Trace: Dropping native anthropic span nested under a Langfuse "
+                    "span | span_name='%s'",
+                    span.name,
+                )
+                return
+
             # Apply custom or default span filter
             try:
                 should_export = self._should_export_span(span)
@@ -332,6 +354,9 @@ class LangfuseSpanProcessor(BatchSpanProcessor):
 
             self._span_export_expectation_by_id[span_id] = expected_exported
 
+            if is_langfuse_span(cast(ReadableSpan, span)):
+                self._langfuse_span_ids.add(span.context.span_id)
+
             mark_app_root = (
                 expected_exported
                 and is_app_root_eligible(cast(ReadableSpan, span))
@@ -349,6 +374,7 @@ class LangfuseSpanProcessor(BatchSpanProcessor):
 
         with self._app_root_lock:
             self._span_export_expectation_by_id.pop(span_id, None)
+            self._langfuse_span_ids.discard(span.context.span_id)
 
     def _is_expected_exported_at_start(self, span: Span) -> bool:
         readable_span = cast(ReadableSpan, span)
